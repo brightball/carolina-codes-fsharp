@@ -39,6 +39,36 @@ let env name fallback =
     | null | "" -> fallback
     | v -> v
 
+let mutable sqlCount = 0
+let mutable connectCount = 0
+let mutable dataSource: NpgsqlDataSource = Unchecked.defaultof<_>
+let mutable openHook: (string -> unit) option = None
+
+let resetCatalog () =
+    sqlCount <- 0
+    connectCount <- 0
+    openHook <- None
+    if not (isNull (box dataSource)) then
+        dataSource.Dispose()
+        dataSource <- Unchecked.defaultof<_>
+
+let openCatalog dsn =
+    connectCount <- connectCount + 1
+    match openHook with
+    | Some h -> h dsn
+    | None -> dataSource <- NpgsqlDataSource.Create(dsn)
+
+let withConn f =
+    if isNull (box dataSource) then failwith "database not opened"
+    use conn = dataSource.OpenConnection()
+    f conn
+
+let execCmd (cmd: NpgsqlCommand) =
+    sqlCount <- sqlCount + 1
+    cmd.ExecuteReader()
+
+let listenUrl (port: string) = $"http://[::]:{port}"
+
 let toNpgsql (dsn: string) =
     if dsn.StartsWith("postgres://") || dsn.StartsWith("postgresql://") then
         let normalized =
@@ -52,7 +82,7 @@ let toNpgsql (dsn: string) =
             else ""
         let db = uri.AbsolutePath.Trim('/')
         let port = if uri.IsDefaultPort || uri.Port < 0 then 5432 else uri.Port
-        $"Host={uri.Host};Port={port};Username={user};Password={pass};Database={db}"
+        $"Host={uri.Host};Port={port};Username={user};Password={pass};Database={db};SSL Mode=Disable"
     else
         dsn
 
@@ -183,7 +213,7 @@ let loadTalks (conn: NpgsqlConnection) (slug: string) (year: int option) =
     match year with
     | Some y -> cmd.Parameters.AddWithValue(y) |> ignore
     | None -> ()
-    use r = cmd.ExecuteReader()
+    use r = execCmd cmd
     let talks = ResizeArray<JsonNode>()
     let langs = ResizeArray<string>()
     let topics = ResizeArray<string>()
@@ -197,7 +227,7 @@ let loadTalks (conn: NpgsqlConnection) (slug: string) (year: int option) =
 let distinctYears (conn: NpgsqlConnection) sql slug =
     use cmd = new NpgsqlCommand(sql, conn)
     cmd.Parameters.AddWithValue(slug) |> ignore
-    use r = cmd.ExecuteReader()
+    use r = execCmd cmd
     [ while r.Read() do yield r.GetInt32(0) ]
 
 let talkYears conn slug =
@@ -215,7 +245,7 @@ let loadSponsorships (conn: NpgsqlConnection) slug =
             conn
         )
     cmd.Parameters.AddWithValue(slug) |> ignore
-    use r = cmd.ExecuteReader()
+    use r = execCmd cmd
     [ while r.Read() do
           yield
               jObj
@@ -233,14 +263,93 @@ let merge (baseObj: JsonNode) (extra: (string * JsonNode) list) =
 let queryRows (conn: NpgsqlConnection) sql (ps: obj list) (map: DbDataReader -> JsonNode) =
     use cmd = new NpgsqlCommand(sql, conn)
     for p in ps do cmd.Parameters.AddWithValue(p) |> ignore
-    use r = cmd.ExecuteReader()
+    use r = execCmd cmd
     [ while r.Read() do yield map r ]
 
 let queryOne (conn: NpgsqlConnection) sql (ps: obj list) (map: DbDataReader -> JsonNode) =
     use cmd = new NpgsqlCommand(sql, conn)
     for p in ps do cmd.Parameters.AddWithValue(p) |> ignore
-    use r = cmd.ExecuteReader()
+    use r = execCmd cmd
     if r.Read() then Some(map r) else None
+
+let pgTextArray (slugs: string list) =
+    "{" + String.Join(",", slugs |> List.map (fun s -> "\"" + s + "\"")) + "}"
+
+let loadTalksForYear (conn: NpgsqlConnection) (year: int) =
+    use cmd =
+        new NpgsqlCommand($"SELECT {talkCols} FROM v1_talks WHERE year = $1 ORDER BY speaker_slug, year DESC", conn)
+    cmd.Parameters.AddWithValue(year) |> ignore
+    use r = execCmd cmd
+    let map =
+        Collections.Generic.Dictionary<string, ResizeArray<JsonNode> * ResizeArray<string> * ResizeArray<string>>()
+    while r.Read() do
+        let t, l, tp = talkObj r
+        let slug = strOpt r "speaker_slug"
+        if not (isNull slug) then
+            let talks, langs, topics =
+                match map.TryGetValue(slug) with
+                | true, v -> v
+                | false, _ ->
+                    let v = ResizeArray<JsonNode>(), ResizeArray<string>(), ResizeArray<string>()
+                    map[slug] <- v
+                    v
+            talks.Add(t)
+            langs.AddRange(l)
+            topics.AddRange(tp)
+    [ for kv in map do
+          let talks, langs, topics = kv.Value
+          yield kv.Key, (talks |> Seq.toList, uniq langs, uniq topics) ]
+    |> Map.ofList
+
+let loadYearsForSlugs (conn: NpgsqlConnection) (slugs: string list) =
+    if List.isEmpty slugs then
+        Map.empty
+    else
+        use cmd =
+            new NpgsqlCommand(
+                "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY($1::text[]) ORDER BY speaker_slug, year DESC",
+                conn
+            )
+        cmd.Parameters.AddWithValue(pgTextArray slugs) |> ignore
+        use r = execCmd cmd
+        let map = Collections.Generic.Dictionary<string, ResizeArray<int>>()
+        while r.Read() do
+            let slug = r.GetString(r.GetOrdinal("speaker_slug"))
+            let y = r.GetInt32(r.GetOrdinal("year"))
+            if not (map.ContainsKey slug) then map[slug] <- ResizeArray<int>()
+            map[slug].Add(y)
+        [ for kv in map -> kv.Key, kv.Value |> Seq.toList ] |> Map.ofList
+
+let listSpeakersYear (conn: NpgsqlConnection) (year: int) =
+    let speakers =
+        queryRows
+            conn
+            $"SELECT {speakerCols} FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) ORDER BY last_name, first_name"
+            [ year ]
+            speakerObj
+    let slugs = speakers |> List.map (fun sp -> sp["slug"].GetValue<string>())
+    let talksBy = loadTalksForYear conn year
+    let yearsBy = loadYearsForSlugs conn slugs
+    [ for sp in speakers do
+          let slug = sp["slug"].GetValue<string>()
+          let talks, langs, topics =
+              match Map.tryFind slug talksBy with
+              | Some v -> v
+              | None -> [], [], []
+          let years =
+              match Map.tryFind slug yearsBy with
+              | Some ys -> ys
+              | None -> []
+          yield
+              merge
+                  sp
+                  [ "year", jInt year
+                    "talks", jArr talks
+                    "languages", jArr (langs |> Seq.map jStr)
+                    "topics", jArr (topics |> Seq.map jStr)
+                    "years", jArr (years |> Seq.map jInt) ] ]
+
+let healthJson () = jObj [ "ok", jBool true ]
 
 let identity () =
     jObj
@@ -291,128 +400,109 @@ let register (port: string) =
 
 let allDigits (s: string) = s.Length > 0 && s |> Seq.forall Char.IsDigit
 
-let handle (ds: NpgsqlDataSource) (path: string) (yearQ: string) : int * JsonNode =
+let handle (path: string) (yearQ: string) : int * JsonNode =
     let parts =
         path.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries)
         |> Array.toList
     try
         match parts with
         | [] -> 200, identity ()
-        | [ "health" ] -> 200, jObj [ "ok", jBool true ]
+        | [ "health" ] -> 200, healthJson ()
         | [ "v1"; "years" ] ->
-            use conn = ds.OpenConnection()
-            let rows =
-                queryRows conn "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC" [] (fun r ->
-                    jObj
-                        [ "year", jInt (intCol r "year")
-                          "slug", jStr (strOpt r "slug")
-                          "name", jStr (strOpt r "name")
-                          "status", jStr (strOpt r "status") ])
-            200, jObj [ "data", jArr rows ]
+            withConn (fun conn ->
+                let rows =
+                    queryRows conn "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC" [] (fun r ->
+                        jObj
+                            [ "year", jInt (intCol r "year")
+                              "slug", jStr (strOpt r "slug")
+                              "name", jStr (strOpt r "name")
+                              "status", jStr (strOpt r "status") ])
+                200, jObj [ "data", jArr rows ])
         | [ "v1"; "speakers" ] when String.IsNullOrEmpty(yearQ) ->
-            use conn = ds.OpenConnection()
-            let rows =
-                queryRows conn $"SELECT {speakerCols} FROM v1_speakers ORDER BY last_name, first_name" [] speakerObj
-            200, jObj [ "data", jArr rows ]
+            withConn (fun conn ->
+                let rows =
+                    queryRows conn $"SELECT {speakerCols} FROM v1_speakers ORDER BY last_name, first_name" [] speakerObj
+                200, jObj [ "data", jArr rows ])
         | [ "v1"; "speakers" ] ->
-            use conn = ds.OpenConnection()
-            let year = int yearQ
-            let speakers =
-                queryRows
-                    conn
-                    $"SELECT {speakerCols} FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) ORDER BY last_name, first_name"
-                    [ year ]
-                    speakerObj
-            let rows =
-                [ for sp in speakers do
-                      let slug = sp["slug"].GetValue<string>()
-                      let talks, langs, topics = loadTalks conn slug (Some year)
-                      let years = talkYears conn slug
-                      yield
-                          merge
-                              sp
-                              [ "year", jInt year
-                                "talks", jArr talks
-                                "languages", jArr (langs |> Seq.map jStr)
-                                "topics", jArr (topics |> Seq.map jStr)
-                                "years", jArr (years |> Seq.map jInt) ] ]
-            200, jObj [ "data", jArr rows ]
+            withConn (fun conn ->
+                let year = int yearQ
+                200, jObj [ "data", jArr (listSpeakersYear conn year) ])
         | [ "v1"; "speakers"; year; slug ] when allDigits year ->
-            use conn = ds.OpenConnection()
-            let y = int year
-            match queryOne conn $"SELECT {speakerCols} FROM v1_speakers WHERE slug = $1" [ slug ] speakerObj with
-            | None -> 404, notFoundNode
-            | Some speaker ->
-                let talks, langs, topics = loadTalks conn slug (Some y)
-                if List.isEmpty talks then
-                    404, notFoundNode
-                else
+            withConn (fun conn ->
+                let y = int year
+                match queryOne conn $"SELECT {speakerCols} FROM v1_speakers WHERE slug = $1" [ slug ] speakerObj with
+                | None -> 404, notFoundNode
+                | Some speaker ->
+                    let talks, langs, topics = loadTalks conn slug (Some y)
+                    if List.isEmpty talks then
+                        404, notFoundNode
+                    else
+                        let years = talkYears conn slug
+                        200,
+                        jObj
+                            [ "data",
+                              merge
+                                  speaker
+                                  [ "year", jInt y
+                                    "years", jArr (years |> Seq.map jInt)
+                                    "other_years", jArr (exceptYear years y |> Seq.map jInt)
+                                    "talks", jArr talks
+                                    "languages", jArr (langs |> Seq.map jStr)
+                                    "topics", jArr (topics |> Seq.map jStr) ] ])
+        | [ "v1"; "speakers"; slug ] ->
+            withConn (fun conn ->
+                match queryOne conn $"SELECT {speakerCols} FROM v1_speakers WHERE slug = $1" [ slug ] speakerObj with
+                | None -> 404, notFoundNode
+                | Some speaker ->
+                    let talks, _, _ = loadTalks conn slug None
                     let years = talkYears conn slug
                     200,
                     jObj
                         [ "data",
                           merge
                               speaker
-                              [ "year", jInt y
-                                "years", jArr (years |> Seq.map jInt)
-                                "other_years", jArr (exceptYear years y |> Seq.map jInt)
-                                "talks", jArr talks
-                                "languages", jArr (langs |> Seq.map jStr)
-                                "topics", jArr (topics |> Seq.map jStr) ] ]
-        | [ "v1"; "speakers"; slug ] ->
-            use conn = ds.OpenConnection()
-            match queryOne conn $"SELECT {speakerCols} FROM v1_speakers WHERE slug = $1" [ slug ] speakerObj with
-            | None -> 404, notFoundNode
-            | Some speaker ->
-                let talks, _, _ = loadTalks conn slug None
-                let years = talkYears conn slug
-                200,
-                jObj
-                    [ "data",
-                      merge
-                          speaker
-                          [ "talks", jArr talks
-                            "years", jArr (years |> Seq.map jInt) ] ]
+                              [ "talks", jArr talks
+                                "years", jArr (years |> Seq.map jInt) ] ])
         | [ "v1"; "sponsors" ] when String.IsNullOrEmpty(yearQ) ->
-            use conn = ds.OpenConnection()
-            let rows = queryRows conn $"SELECT {sponsorCols} FROM v1_sponsors ORDER BY name" [] sponsorObj
-            200, jObj [ "data", jArr rows ]
+            withConn (fun conn ->
+                let rows = queryRows conn $"SELECT {sponsorCols} FROM v1_sponsors ORDER BY name" [] sponsorObj
+                200, jObj [ "data", jArr rows ])
         | [ "v1"; "sponsors" ] ->
-            use conn = ds.OpenConnection()
-            let year = int yearQ
-            let rows =
-                queryRows
-                    conn
-                    $"SELECT {yearSponsorCols} FROM v1_year_sponsors WHERE year = $1 ORDER BY name"
-                    [ year ]
-                    yearSponsorObj
-            200, jObj [ "data", jArr rows ]
+            withConn (fun conn ->
+                let year = int yearQ
+                let rows =
+                    queryRows
+                        conn
+                        $"SELECT {yearSponsorCols} FROM v1_year_sponsors WHERE year = $1 ORDER BY name"
+                        [ year ]
+                        yearSponsorObj
+                200, jObj [ "data", jArr rows ])
         | [ "v1"; "sponsors"; year; slug ] when allDigits year ->
-            use conn = ds.OpenConnection()
-            let y = int year
-            match
-                queryOne
-                    conn
-                    $"SELECT {yearSponsorCols} FROM v1_year_sponsors WHERE year = $1 AND slug = $2"
-                    [ y; slug ]
-                    yearSponsorObj
-            with
-            | None -> 404, notFoundNode
-            | Some sponsor ->
-                let years = sponsorYears conn slug
-                200,
-                jObj
-                    [ "data",
-                      merge
-                          sponsor
-                          [ "years", jArr (years |> Seq.map jInt)
-                            "other_years", jArr (exceptYear years y |> Seq.map jInt) ] ]
+            withConn (fun conn ->
+                let y = int year
+                match
+                    queryOne
+                        conn
+                        $"SELECT {yearSponsorCols} FROM v1_year_sponsors WHERE year = $1 AND slug = $2"
+                        [ y; slug ]
+                        yearSponsorObj
+                with
+                | None -> 404, notFoundNode
+                | Some sponsor ->
+                    let years = sponsorYears conn slug
+                    200,
+                    jObj
+                        [ "data",
+                          merge
+                              sponsor
+                              [ "years", jArr (years |> Seq.map jInt)
+                                "other_years", jArr (exceptYear years y |> Seq.map jInt) ] ])
         | [ "v1"; "sponsors"; slug ] ->
-            use conn = ds.OpenConnection()
-            match queryOne conn $"SELECT {sponsorCols} FROM v1_sponsors WHERE slug = $1" [ slug ] sponsorObj with
-            | None -> 404, notFoundNode
-            | Some sponsor ->
-                200, jObj [ "data", merge sponsor [ "sponsorships", jArr (loadSponsorships conn slug) ] ]
+            withConn (fun conn ->
+                match queryOne conn $"SELECT {sponsorCols} FROM v1_sponsors WHERE slug = $1" [ slug ] sponsorObj with
+                | None -> 404, notFoundNode
+                | Some sponsor ->
+                    200, jObj [ "data", merge sponsor [ "sponsorships", jArr (loadSponsorships conn slug) ] ])
         | _ -> 404, notFoundNode
     with
     | ex -> 500, jObj [ "error", jStr ex.Message ]
@@ -421,10 +511,10 @@ let handle (ds: NpgsqlDataSource) (path: string) (yearQ: string) : int * JsonNod
 let main args =
     let dsn = toNpgsql (env "DATABASE_URL" "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev")
     let port = env "PORT" "4010"
-    let dataSource = NpgsqlDataSource.Create(dsn)
+    openCatalog dsn
 
     let builder = WebApplication.CreateBuilder(args)
-    builder.WebHost.UseUrls($"http://0.0.0.0:{port}") |> ignore
+    builder.WebHost.UseUrls(listenUrl port) |> ignore
     let app = builder.Build()
 
     let dispatcher =
@@ -440,7 +530,7 @@ let main args =
                 else
                     let path = if isNull ctx.Request.Path.Value then "/" else ctx.Request.Path.Value
                     let yearQ = ctx.Request.Query["year"].ToString()
-                    let status, node = handle dataSource path yearQ
+                    let status, node = handle path yearQ
                     ctx.Response.StatusCode <- status
                     ctx.Response.ContentType <- "application/json"
                     if method <> HttpMethods.Head then
