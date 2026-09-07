@@ -1,0 +1,14 @@
+{
+  "name": "carolina-codes-fsharp",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "install": "dotnet restore",
+  "ports": [
+    {
+      "name": "api",
+      "port": 4010
+    }
+  ]
+}
