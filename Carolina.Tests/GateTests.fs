@@ -132,6 +132,7 @@ let ``gitea prep clones and installs once; check jobs restore the workspace arti
     Assert.Contains("missing job token for git fetch", prep)
     Assert.Contains("make restore", prep)
     Assert.Contains("semgrep==1.97.0", prep)
+    Assert.Contains("setuptools==70.3.0", prep)
     Assert.Contains("gitleaks_8.30.1_linux_x64.tar.gz", prep)
     Assert.Contains(".ci/semgrep", prep)
     Assert.Contains(".ci/bin", prep)
