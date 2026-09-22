@@ -1,0 +1,10 @@
+# Ignore the Gitea prep workspace (NuGet cache, vendored semgrep, gitleaks).
+# Keep default rules; a config without extend replaces them and finds nothing.
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+  '''(^|/)\.ci/''',
+  '''prep-workspace\.tar\.gz$''',
+]

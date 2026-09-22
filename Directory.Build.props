@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <!-- Fails the existing make test / test job. Not a separate workflow check. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>5</WarningLevel>
+  </PropertyGroup>
+</Project>

@@ -1,13 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
-    <Nullable>enable</Nullable>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
     <RollForward>LatestMajor</RollForward>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="TestPaths.fs" />
     <Compile Include="PerfTests.fs" />
+    <Compile Include="HandlerTests.fs" />
+    <Compile Include="GateTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />

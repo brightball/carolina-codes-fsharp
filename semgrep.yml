@@ -1,0 +1,38 @@
+# Semgrep CE rules that scan this repo's F# source (generic matcher on *.fs).
+# C# Roslyn analyzers skip .fs files; these rules do not.
+rules:
+  - id: fsharp-sql-string-concat
+    message: SQL command built with string concatenation can be injection-prone. Use parameterized NpgsqlCommand values.
+    languages: [generic]
+    severity: ERROR
+    paths:
+      include:
+        - "*.fs"
+    pattern-regex: 'NpgsqlCommand\([^)]*\+'
+
+  - id: fsharp-process-shell
+    message: Starting a process via a shell can allow command injection.
+    languages: [generic]
+    severity: ERROR
+    paths:
+      include:
+        - "*.fs"
+    pattern-regex: 'Process\.Start\(\s*"/bin/(ba)?sh"'
+
+  - id: fsharp-hardcoded-password
+    message: Hardcoded password or secret assignment in F# source.
+    languages: [generic]
+    severity: ERROR
+    paths:
+      include:
+        - "*.fs"
+    pattern-regex: '(?i)(password|secret|api[_-]?key)\s*=\s*"(?!\{)[^"]{8,}"'
+
+  - id: fsharp-insecure-ssl-bypass
+    message: Certificate validation is disabled.
+    languages: [generic]
+    severity: ERROR
+    paths:
+      include:
+        - "*.fs"
+    pattern-regex: 'ServerCertificateCustomValidationCallback\s*=\s*\(.*?\)\s*->\s*true'

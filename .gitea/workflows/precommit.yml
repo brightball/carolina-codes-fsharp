@@ -1,0 +1,147 @@
+# One Gitea Actions job per check. Not a single combined job.
+#
+# act_runner starts a new container per job, so jobs cannot share a live
+# image. Host bind-mounts are also blocked (valid_volumes is empty).
+# Prep checks out GITHUB_SHA, restores NuGet/local tools, vendors semgrep
+# and gitleaks into the tree, and uploads a workspace tarball. Check jobs
+# restore that artifact and run only their Make target. The dotnet SDK
+# image has no Node, so those jobs apt-get nodejs only to run the
+# artifact action — they do not clone or reinstall packages.
+#
+# Empty dotnet image: clone GITHUB_SHA with the job token over HTTPS.
+# Gitea git HTTP returns 401 without the token. Do not git init or set
+# init.defaultBranch here.
+name: precommit
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: precommit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:8.0
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates make python3 python3-pip curl tar nodejs
+      - run: |
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
+          host="${GITHUB_SERVER_URL#https://}"
+          host="${host#http://}"
+          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+      - run: |
+          export NUGET_PACKAGES="$PWD/.ci/nuget"
+          export DOTNET_CLI_HOME="$PWD/.ci/dotnet"
+          mkdir -p "$NUGET_PACKAGES" "$DOTNET_CLI_HOME"
+          make restore
+      - run: |
+          mkdir -p .ci/semgrep .ci/bin
+          PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir --target .ci/semgrep 'semgrep==1.97.0'
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz -C .ci/bin gitleaks
+          chmod +x .ci/bin/gitleaks
+          .ci/bin/gitleaks version
+      # Exclude .git so the clone token in .git/config is not packed.
+      # make secrets uses --no-git and scans the extracted tree as files.
+      - run: |
+          tar -czf /tmp/prep-workspace.tar.gz --exclude=./.git .
+          mv /tmp/prep-workspace.tar.gz prep-workspace.tar.gz
+      - uses: actions/upload-artifact@v3
+        with:
+          name: prep-workspace
+          path: prep-workspace.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:8.0
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates make nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make test
+
+  sast:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:8.0
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates make nodejs python3
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make sast
+
+  audit:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:8.0
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates make nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make audit
+
+  gitleaks:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:8.0
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates make nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make secrets
+
+  style:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:8.0
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates make nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make lint
