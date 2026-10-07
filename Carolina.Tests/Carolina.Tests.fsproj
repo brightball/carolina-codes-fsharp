@@ -11,6 +11,7 @@
     <Compile Include="PerfTests.fs" />
     <Compile Include="HandlerTests.fs" />
     <Compile Include="GateTests.fs" />
+    <Compile Include="DocTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />

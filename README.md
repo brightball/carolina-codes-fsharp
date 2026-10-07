@@ -4,6 +4,16 @@ Read-only v1 polyglot API for Carolina Code Conference. F# + ASP.NET + Npgsql.
 
 Queries PostgreSQL `v1_*` views. Registers with Elixir once on boot.
 
+## Versions
+
+- Language: F# on .NET 8. `global.json` pins SDK `8.0.100` with `rollForward` `latestMajor`. Target framework `net8.0`.
+- Framework: ASP.NET Core 8, the shared framework from `Microsoft.NET.Sdk.Web` and `mcr.microsoft.com/dotnet/aspnet:8.0`. The build image is `mcr.microsoft.com/dotnet/sdk:8.0`. The registered identity string is `ASP.NET`.
+- Database client: Npgsql 8.0.6.
+- Tests: xUnit 2.9.2, Microsoft.NET.Test.Sdk 17.11.1, xunit.runner.visualstudio 2.8.2.
+- Formatting: Fantomas 7.0.6 (`.config/dotnet-tools.json`, `make lint`).
+- Secrets scan: gitleaks 8.30.1 (mise).
+- Cold start: ReadyToRun (`PublishReadyToRun` on Release publish). That is the cold-start improvement for this runtime. This service does not use JVM CRaC.
+
 ```bash
 make test        # xUnit via dotnet test (no Postgres for handler cases)
 make sast        # Semgrep CE scan of F# source
