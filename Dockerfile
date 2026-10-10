@@ -1,7 +1,7 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 COPY Carolina.fsproj global.json Directory.Build.props ./
-RUN dotnet restore Carolina.fsproj -r linux-x64
+RUN dotnet restore Carolina.fsproj -r linux-x64 -p:PublishReadyToRun=true
 COPY Program.fs ./
 RUN dotnet publish Carolina.fsproj -c Release -r linux-x64 -o /app --no-restore --self-contained false -p:PublishReadyToRun=true
 

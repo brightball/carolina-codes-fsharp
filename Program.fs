@@ -720,28 +720,27 @@ let main args =
     let app = builder.Build()
 
     // Run(handler) only installs terminal middleware. The parameterless Run starts Kestrel.
+    // Headers are applied before WriteAsync. A for/in loop inside task is not a static state machine (FS3511).
     app.Run(
         RequestDelegate(fun ctx ->
-            task {
-                let method = ctx.Request.Method
+            let method = ctx.Request.Method
 
-                let path = if isNull ctx.Request.Path.Value then "/" else ctx.Request.Path.Value
+            let path = if isNull ctx.Request.Path.Value then "/" else ctx.Request.Path.Value
 
-                let mutable yearValues = ctx.Request.Query["year"]
-                let yearQ = yearValues.ToString()
-                let reply = dispatch method path yearQ
+            // StringValues is a struct. A mutable local avoids FS0052 on the member access.
+            let mutable yearValues = ctx.Request.Query["year"]
+            let yearQ = yearValues.ToString()
+            let reply = dispatch method path yearQ
 
-                for key, value in reply.Headers do
-                    ctx.Response.Headers[key] <- value
+            reply.Headers
+            |> List.iter (fun (key, value) -> ctx.Response.Headers[key] <- value)
 
-                ctx.Response.StatusCode <- reply.Status
-                ctx.Response.ContentType <- reply.ContentType
+            ctx.Response.StatusCode <- reply.Status
+            ctx.Response.ContentType <- reply.ContentType
 
-                match reply.Body with
-                | Some body -> do! ctx.Response.WriteAsync(body)
-                | None -> ()
-            }
-            :> Task)
+            match reply.Body with
+            | Some body -> ctx.Response.WriteAsync(body)
+            | None -> Task.CompletedTask)
     )
 
     app.Lifetime.ApplicationStarted.Register(fun () ->

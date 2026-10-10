@@ -419,3 +419,105 @@ let ``release publish precompiles and semgrep still scans F#`` () =
     let semgrep = repoFile "semgrep.yml"
     Assert.Contains("*.fs", semgrep)
     Assert.Contains("languages: [generic]", semgrep)
+
+// SDK 8 is the image compiler. A newer host SDK can miss FS3511 for the same task.
+let imageSdkDotnet () =
+    let home = Environment.GetFolderPath Environment.SpecialFolder.UserProfile
+    let root = Path.Combine(home, ".dotnet")
+    let host = Path.Combine(root, "dotnet")
+    let sdk = Path.Combine(root, "sdk")
+
+    let hasSdk8 =
+        Directory.Exists sdk
+        && Directory.GetDirectories(sdk)
+           |> Array.exists (fun dir -> Path.GetFileName(dir).StartsWith("8."))
+
+    if File.Exists host && hasSdk8 then Some(host, root) else None
+
+let runDotnet (dotnetHost: string) (dotnetRoot: string option) (arguments: string) =
+    let psi =
+        ProcessStartInfo(
+            FileName = dotnetHost,
+            Arguments = arguments,
+            WorkingDirectory = repoRoot (),
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        )
+
+    // dotnet test inherits MSBuildSDKsPath from the host SDK. A child publish must
+    // resolve the SDK next to the dotnet it launches, or ReadyToRun hits the wrong compiler.
+    for key in
+        [ "MSBuildSDKsPath"
+          "MSBUILD_EXE_PATH"
+          "DOTNET_HOST_PATH"
+          "MSBuildExtensionsPath"
+          "MSBuildExtensionsPath32"
+          "MSBuildExtensionsPath64" ] do
+        psi.Environment.Remove(key) |> ignore
+
+    // A vendored NUGET_PACKAGES cache does not contain the ReadyToRun crossgen pack.
+    psi.Environment.Remove("NUGET_PACKAGES") |> ignore
+
+    match dotnetRoot with
+    | Some root ->
+        psi.Environment["DOTNET_ROOT"] <- root
+        psi.Environment["DOTNET_MULTILEVEL_LOOKUP"] <- "0"
+        let path = psi.Environment["PATH"]
+        psi.Environment["PATH"] <- root + string Path.PathSeparator + path
+    | None -> ()
+
+    use proc =
+        match Process.Start psi with
+        | null -> failwith "failed to start dotnet"
+        | started -> started
+
+    let stdout = proc.StandardOutput.ReadToEnd()
+    let stderr = proc.StandardError.ReadToEnd()
+    proc.WaitForExit()
+    stdout + stderr, proc.ExitCode
+
+[<Fact>]
+let ``release linux-x64 publish with ReadyToRun succeeds without FS3511`` () =
+    let docker = repoFile "Dockerfile"
+
+    Assert.Contains("dotnet restore Carolina.fsproj -r linux-x64 -p:PublishReadyToRun=true", docker)
+
+    let sources =
+        repoFile "Program.fs"
+        + repoFile "Carolina.fsproj"
+        + repoFile "Directory.Build.props"
+        + repoFile "Carolina.Tests/Carolina.Tests.fsproj"
+
+    Assert.DoesNotContain("#nowarn \"3511\"", sources)
+    Assert.DoesNotContain("<NoWarn>", sources)
+    Assert.DoesNotContain("WarningsNotAsErrors", sources)
+
+    let dotnetHost, dotnetRoot =
+        match imageSdkDotnet () with
+        | Some(host, root) -> host, Some root
+        | None -> "dotnet", None
+
+    let outDir =
+        Path.Combine(Path.GetTempPath(), "carolina-r2r-" + Guid.NewGuid().ToString("N"))
+
+    try
+        let restoreOut, restoreCode =
+            runDotnet dotnetHost dotnetRoot "restore Carolina.fsproj -r linux-x64 -p:PublishReadyToRun=true"
+
+        Assert.True((restoreCode = 0), sprintf "host=%s restore failed: %s" dotnetHost restoreOut)
+
+        let publishArgs =
+            sprintf
+                "publish Carolina.fsproj -c Release -r linux-x64 -o \"%s\" --no-restore --self-contained false -p:PublishReadyToRun=true"
+                outDir
+
+        let publishOut, publishCode = runDotnet dotnetHost dotnetRoot publishArgs
+        let combined = restoreOut + publishOut
+
+        Assert.True((publishCode = 0), sprintf "publish exit %d: %s" publishCode combined)
+        Assert.DoesNotContain("FS3511", combined)
+        Assert.True(File.Exists(Path.Combine(outDir, "Carolina.dll")))
+    finally
+        if Directory.Exists outDir then
+            Directory.Delete(outDir, true)
